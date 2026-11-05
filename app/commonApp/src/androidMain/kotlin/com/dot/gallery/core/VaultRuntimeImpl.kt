@@ -8,6 +8,8 @@ package com.dot.gallery.core
 import android.net.Uri
 import androidx.core.net.toUri
 import com.dot.gallery.core.work.WorkSignals
+import com.dot.gallery.core.work.WorkInput
+import com.dot.gallery.core.work.VaultQueueFiles
 import com.dot.gallery.core.work.isFinished
 import com.dot.gallery.core.workers.VaultOperationWorker
 import com.dot.gallery.core.workers.enqueueVaultOperation
@@ -87,17 +89,37 @@ class VaultRuntimeImpl @Inject constructor(
             .filter { it.isFinished }
             .first()
         return when (info.state) {
-            is TaskState.Succeeded -> VaultOpOutcome.Succeeded(
-                succeededCount = info.output
-                    ?.takeIf { it.hasKeyWithValueOfType<Int>(VaultOperationWorker.KEY_SUCCEEDED_COUNT) }
-                    ?.getInt(VaultOperationWorker.KEY_SUCCEEDED_COUNT, 0),
-                leftoverUris = info.output?.getString(VaultOperationWorker.KEY_LEFTOVER_URIS)
-                    ?.let { Json.decodeFromString<List<String>>(it).map { s -> s.toUri() } }
-                    .orEmpty(),
-            )
+            is TaskState.Succeeded -> {
+                val leftoverUris = readLeftoverUris(info.output)
+                VaultOpOutcome.Succeeded(
+                    succeededCount = info.output
+                        ?.takeIf { it.hasKeyWithValueOfType<Int>(VaultOperationWorker.KEY_SUCCEEDED_COUNT) }
+                        ?.getInt(VaultOperationWorker.KEY_SUCCEEDED_COUNT, 0),
+                    leftoverUris = leftoverUris,
+                )
+            }
             is TaskState.Failed -> VaultOpOutcome.Failed
             else -> VaultOpOutcome.Cancelled
         }
+    }
+
+    /**
+     * Leftovers normally live in a file (the list can exceed the worker output cap). Legacy
+     * inline `leftoverUris` is still accepted for tasks enqueued before this change.
+     */
+    private fun readLeftoverUris(output: WorkInput?): List<Uri> {
+        val leftoverPath = output?.getString(VaultOperationWorker.KEY_LEFTOVER_FILE)
+        if (leftoverPath != null) {
+            val file = java.io.File(leftoverPath)
+            return try {
+                runCatching { VaultQueueFiles.read(file).map { it.toUri() } }.getOrDefault(emptyList())
+            } finally {
+                runCatching { file.delete() }
+            }
+        }
+        return output?.getString(VaultOperationWorker.KEY_LEFTOVER_URIS)
+            ?.let { Json.decodeFromString<List<String>>(it).map { s -> s.toUri() } }
+            .orEmpty()
     }
 
     private val VaultOp.wireName: String

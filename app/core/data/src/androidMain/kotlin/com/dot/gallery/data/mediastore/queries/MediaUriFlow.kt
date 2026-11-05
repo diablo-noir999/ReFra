@@ -30,6 +30,7 @@ import com.dot.gallery.domain.model.CaptureTimeOrigin
 import com.dot.gallery.domain.model.Media
 import com.dot.gallery.domain.model.MediaType
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.emptyFlow
 import kotlinx.coroutines.flow.map
 import com.dot.gallery.domain.model.UriMedia
 import com.dot.gallery.cloud.core.matches
@@ -67,6 +68,10 @@ class MediaUriFlow(
     private var buckedId: Long = MediaStoreBuckets.MEDIA_STORE_BUCKET_TIMELINE.id
 
     override fun flowCursor(): Flow<Cursor?> {
+        // `onlyMatchingUris` means "resolve exactly this selection". If none of the supplied
+        // URIs yields an id, an unscoped query would return the entire library — exactly the
+        // wrong result for a bulk import. Return nothing instead.
+        if (onlyMatchingUris && candidateIds.isEmpty()) return emptyFlow()
         val uri = MediaQuery.MediaStoreFileUri
         val projection = MediaQuery.MediaProjection
         val imageOrVideo = PickerUtils.mediaTypeFromGenericMimeType(mimeType)?.let {
@@ -272,10 +277,20 @@ class MediaUriFlow(
         return if (uri.scheme == ContentResolver.SCHEME_CONTENT) {
             try {
                 ContentUris.parseId(uri)
-            } catch (e: NumberFormatException) {
-                // Unexpected malformed content URI; exclude.
-                printWarning("MediaUriFlow: Failed to parse content URI id: $uri -> ${e.message}")
-                null
+            } catch (e: Exception) {
+                // Document providers encode the id inside the last path segment
+                // (`.../document/image%3A123` -> lastPathSegment "image:123"), where
+                // ContentUris.parseId finds no trailing numeric segment and throws.
+                val fromDocumentUri = uri.lastPathSegment
+                    ?.substringAfterLast(':')
+                    ?.toLongOrNull()
+                if (fromDocumentUri != null) {
+                    fromDocumentUri
+                } else {
+                    // Unexpected malformed content URI; exclude.
+                    printWarning("MediaUriFlow: Failed to parse content URI id: $uri -> ${e.message}")
+                    null
+                }
             }
         } else {
             // file:// or other scheme; check for encrypted vault naming pattern

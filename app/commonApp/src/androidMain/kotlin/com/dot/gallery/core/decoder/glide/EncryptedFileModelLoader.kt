@@ -9,6 +9,7 @@ import com.bumptech.glide.load.data.DataFetcher
 import com.bumptech.glide.load.model.ModelLoader
 import com.bumptech.glide.load.model.ModelLoaderFactory
 import com.bumptech.glide.load.model.MultiModelLoaderFactory
+import com.dot.gallery.data.thumbnail.VaultThumbnailStore
 import java.io.File
 import java.security.MessageDigest
 
@@ -31,7 +32,7 @@ class EncryptedFileModelLoader(
         if (!handles(model)) return null
         return ModelLoader.LoadData(
             EncryptedVaultKey(model.path),
-            EncryptedVaultFetcher(model, context)
+            EncryptedVaultFetcher(model, context, options.get(VaultThumbnailOption))
         )
     }
 
@@ -64,7 +65,7 @@ class EncryptedUriModelLoader(
         if (!handles(model)) return null
         return ModelLoader.LoadData(
             EncryptedVaultKey(file.path),
-            EncryptedVaultFetcher(file, context)
+            EncryptedVaultFetcher(file, context, options.get(VaultThumbnailOption))
         )
     }
 
@@ -88,7 +89,8 @@ data class EncryptedVaultKey(private val path: String) : com.bumptech.glide.load
 
 private class EncryptedVaultFetcher(
     private val file: File,
-    private val context: Context
+    private val context: Context,
+    private val useThumbnail: Boolean
 ) : DataFetcher<EncryptedMediaStream> {
 
     private var stream: EncryptedMediaStream? = null
@@ -100,7 +102,23 @@ private class EncryptedVaultFetcher(
     ) {
         if (cancelled) return
         try {
-            val result = decryptVaultFile(file, context)
+            // Grid requests opt into the pre-generated encrypted tile: a few KB instead of a
+            // whole-file decrypt. Missing/undecryptable tiles fall back to the original.
+            val thumbnail = if (useThumbnail) {
+                VaultThumbnailStore.thumbnailForEncrypted(context.filesDir, file)
+                    ?.let { createVaultThumbnailSource(context, it) }
+            } else null
+            val result = thumbnail?.asMediaStream() ?: decryptVaultFile(file, context)
+            thumbnail?.release()
+            // Legacy vaults have no stored tile. Freeze one from the bytes we already decrypted
+            // (only stills; video bytes would need a temp file and the import freeze covers them).
+            if (thumbnail == null && useThumbnail && !result.isVideo) {
+                runCatching {
+                    val vault = vaultForEncryptedFile(file) ?: return@runCatching
+                    val mediaId = file.nameWithoutExtension.toLongOrNull() ?: return@runCatching
+                    VaultThumbnailStore.get(context).ensureFromBytes(vault, mediaId, result.bytes)
+                }
+            }
             stream = result
             callback.onDataReady(result)
         } catch (e: Exception) {

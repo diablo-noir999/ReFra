@@ -1009,16 +1009,20 @@ class ConfigBackupManagerImpl @Inject constructor(
             vaultEntry.media.forEach { mediaEntry ->
                 val srcFile = File(tmpDir, mediaEntry.fileName)
                 val outFile = with(keychainHolder) { vault.mediaFile(mediaEntry.id) }
-                if (outFile.exists()) outFile.delete()
+                // Encrypt to scratch and publish atomically: a failed restore must not destroy
+                // an existing vault item that shares this id.
+                val tmpFile = keychainHolder.tempFileFor(outFile).apply { delete() }
                 try {
                     srcFile.inputStream().use { input ->
-                        keychainHolder.encryptPortableStream(vault, input, outFile)
+                        keychainHolder.encryptPortableStream(vault, input, tmpFile, srcFile.length())
                     }
+                    keychainHolder.commitEncryptedFile(tmpFile, outFile)
                     outFile.setLastModified(System.currentTimeMillis())
                     database.getVaultDao().addMediaToVault(mediaEntry.toEncryptedMedia2(uuid))
                     mediaCount++
                     onMediaRestored(mediaCount)
                 } catch (e: Exception) {
+                    tmpFile.delete()
                     mediaSkipped++
                     issues += ImportIssue(
                         BackupSection.VAULTS,
@@ -1026,7 +1030,6 @@ class ConfigBackupManagerImpl @Inject constructor(
                         e.message ?: context.getString(Res.string.backup_issue_vault_media_import_failed)
                     )
                     printError("ConfigBackupManager: failed to import vault media ${mediaEntry.id}: ${e.message}")
-                    outFile.delete()
                 }
             }
         }

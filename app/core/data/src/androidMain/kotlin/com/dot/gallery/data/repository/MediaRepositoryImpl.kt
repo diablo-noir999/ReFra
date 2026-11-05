@@ -13,8 +13,6 @@ import android.database.ContentObserver
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.ImageDecoder
-import java.io.ByteArrayInputStream
-import java.io.ByteArrayOutputStream
 import android.location.Geocoder
 import android.net.Uri
 import android.os.Bundle
@@ -63,6 +61,7 @@ import com.dot.gallery.core.util.ext.updateMedia
 import com.dot.gallery.core.util.ext.updateMediaExif
 import com.dot.gallery.core.security.AdvancedProtectionMonitor
 import com.dot.gallery.data.dao.CategoryWithMediaCount
+import com.dot.gallery.data.thumbnail.VaultThumbnailStore
 import com.dot.gallery.data.InternalDatabase
 import com.dot.gallery.data.entity.SmartScanFeature
 import com.dot.gallery.data.mediastore.MediaQuery
@@ -142,6 +141,7 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.io.File
+import java.io.FileOutputStream
 import java.io.IOException
 import com.dot.gallery.domain.model.EncryptedMedia2
 import com.dot.gallery.cloud.core.ProviderType
@@ -237,6 +237,8 @@ class MediaRepositoryImpl(
 ) : MediaRepository {
 
     private val settingsStore by lazy { DataStoreSettingsStore(context.activeDataStore) }
+
+    private val thumbnailStore by lazy { VaultThumbnailStore.get(context) }
 
     private val contentResolver = context.contentResolver
     private val captureTimeIndexFlow: Flow<Map<Long, MediaCaptureTimeEntity>> = flow {
@@ -554,13 +556,23 @@ class MediaRepositoryImpl(
         listOfUris: List<Uri>,
         reviewMode: Boolean,
         onlyMatching: Boolean
-    ): Flow<Resource<List<UriMedia>>> =
-        MediaUriFlow(
-            contentResolver = contentResolver,
-            uris = listOfUris,
-            onlyMatchingUris = onlyMatching
-        ).flowData().withCaptureTimeIndex()
-            .mapAsResource(errorOnEmpty = true, errorMessage = "Media could not be opened")
+    ): Flow<Resource<List<UriMedia>>> {
+        // Large selections are resolved in bounded batches: a single MediaStore query with
+        // thousands of bound `_ID IN (...)` values can trip SQLite's parameter limit or the
+        // binder transaction size during a bulk vault import.
+        return flow {
+            val merged = ArrayList<UriMedia>(listOfUris.size)
+            for (chunk in listOfUris.chunked(URIS_PER_MEDIA_QUERY)) {
+                val items = MediaUriFlow(
+                    contentResolver = contentResolver,
+                    uris = chunk,
+                    onlyMatchingUris = onlyMatching
+                ).flowData().withCaptureTimeIndex().firstOrNull().orEmpty()
+                merged += items
+            }
+            emit(merged.distinctBy { it.id })
+        }.mapAsResource(errorOnEmpty = true, errorMessage = "Media could not be opened")
+    }
 
     private suspend fun <T : Media> mutateMediaDirectly(
         mediaList: List<T>,
@@ -1172,6 +1184,7 @@ class MediaRepositoryImpl(
                         } else {
                             printWarning("Encrypted Media ${media.id} under ${vault.uuid} does not exist. It will be deleted from the database.")
                             database.getVaultDao().deleteMediaFromVault(media)
+                            thumbnailStore.delete(vault, media.id)
                             null
                         }
                     } catch (e: Throwable) {
@@ -1198,23 +1211,32 @@ class MediaRepositoryImpl(
                     printWarning("Vault row for ${media.id} has no backing file; re-encrypting")
                     database.getVaultDao().deleteMediaFromVault(vault.uuid, media.id)
                 }
-                val output = vault.mediaFile(media.id).apply { if (exists()) delete() }
+                val target = vault.mediaFile(media.id)
                 // Ensure vault uses portable format for streaming encryption
                 if (!isTransferable(vault)) {
                     writeVaultInfo(vault, transferable = true)
                 }
+                // Encrypt into a scratch file and publish it atomically at the very end. If the
+                // process dies mid-encryption, the previous vault copy (if any) is untouched and
+                // only the `.tmp` file is lost.
+                val temp = tempFileFor(target).apply { delete() }
                 return@withContext try {
                     val inputStream = context.contentResolver.openInputStream(media.getUri())
                         ?: return@withContext false
                     inputStream.use { input ->
-                        encryptPortableStream(vault, input, output)
+                        encryptPortableStream(vault, input, temp, media.size)
                     }
-                    output.setLastModified(System.currentTimeMillis())
+                    commitEncryptedFile(temp, target)
+                    target.setLastModified(System.currentTimeMillis())
                     database.getVaultDao().addMediaToVault(media.toEncryptedMedia2(vault.uuid))
+                    // Freeze a small encrypted tile now, while the source URI is guaranteed to be
+                    // readable. Best effort: a decode failure only means the grid falls back to
+                    // decrypting the original.
+                    runCatching { thumbnailStore.ensure(vault, media) }
                     true
                 } catch (e: Exception) {
                     printError(TAG, "Failed to add file: ${media.label}", e)
-                    output.delete()
+                    temp.delete()
                     false
                 }
             }
@@ -1285,6 +1307,7 @@ class MediaRepositoryImpl(
                     }
                     val deleted = if (restored) encFile.delete() else false
                     if (deleted) {
+                        thumbnailStore.delete(vault, media.id)
                         database.getVaultDao()
                             .deleteMediaFromVault(vault.uuid, media.id)
                     }
@@ -1314,27 +1337,40 @@ class MediaRepositoryImpl(
                     printError("Transfer failed: source file does not exist for ${media.label} (id=${media.id})")
                     return@withContext false
                 }
-                val targetFile = targetVault.mediaFile(media.id).apply { if (exists()) delete() }
-                // Decrypt from source, re-encrypt into target
-                val buffer = ByteArrayOutputStream()
-                if (isPortableFile(sourceFile)) {
-                    decryptPortableStream(sourceVault, sourceFile, buffer)
-                } else {
-                    val legacy = sourceFile.decryptKotlin<EncryptedMedia>()
-                    buffer.write(legacy.bytes)
+                val targetFile = targetVault.mediaFile(media.id)
+                val targetTemp = tempFileFor(targetFile).apply { delete() }
+                // Decrypt to a scratch file instead of a ByteArrayOutputStream: a transfer of a
+                // multi-GB video must not be staged in RAM. Then re-encrypt into a second scratch
+                // file and publish atomically, keeping the source/target intact on failure.
+                val plainTemp = File.createTempFile("vault_transfer_", ".tmp", context.cacheDir)
+                try {
+                    if (isPortableFile(sourceFile)) {
+                        FileOutputStream(plainTemp).use { out ->
+                            decryptPortableStream(sourceVault, sourceFile, out)
+                        }
+                    } else {
+                        val legacy = sourceFile.decryptKotlin<EncryptedMedia>()
+                        FileOutputStream(plainTemp).use { it.write(legacy.bytes) }
+                    }
+                    if (plainTemp.length() == 0L) {
+                        printError("Transfer failed: decrypted data is empty for ${media.label}")
+                        return@withContext false
+                    }
+                    plainTemp.inputStream().use { input ->
+                        encryptPortableStream(targetVault, input, targetTemp, plainTemp.length())
+                    }
+                    commitEncryptedFile(targetTemp, targetFile)
+                    targetFile.setLastModified(System.currentTimeMillis())
+                } finally {
+                    plainTemp.delete()
+                    targetTemp.delete()
                 }
-                val decryptedBytes = buffer.toByteArray()
-                if (decryptedBytes.isEmpty()) {
-                    printError("Transfer failed: decrypted data is empty for ${media.label}")
-                    return@withContext false
-                }
-                ByteArrayInputStream(decryptedBytes).use { input ->
-                    encryptPortableStream(targetVault, input, targetFile)
-                }
-                targetFile.setLastModified(System.currentTimeMillis())
                 database.getVaultDao().addMediaToVault(media.toEncryptedMedia2(targetVault.uuid))
+                // Target vault uses a different data key, so re-encrypt the tile for it.
+                runCatching { thumbnailStore.copy(sourceVault, targetVault, media.id) }
                 if (!copy) {
                     sourceFile.delete()
+                    thumbnailStore.delete(sourceVault, media.id)
                     database.getVaultDao().deleteMediaFromVault(sourceVault.uuid, media.id)
                 }
                 printInfo("Transferred ${media.label} from ${sourceVault.name} to ${targetVault.name} (copy=$copy)")
@@ -1353,6 +1389,7 @@ class MediaRepositoryImpl(
                 return@withContext try {
                     val deleted = vault.mediaFile(media.id).delete()
                     if (deleted) {
+                        thumbnailStore.delete(vault, media.id)
                         database.getVaultDao().deleteMediaFromVault(vault.uuid, media.id)
                     }
                     deleted
@@ -1385,6 +1422,8 @@ class MediaRepositoryImpl(
                 }
             }
             if (failedFiles.isEmpty()) {
+                // No vault media left, so every thumbnail is orphaned too.
+                thumbnailStore.deleteAll(vault)
                 onSuccess()
                 true
             } else {
@@ -2041,6 +2080,9 @@ class MediaRepositoryImpl(
     companion object {
         private const val TAG = "vault.media"
         private const val SQLITE_BIND_CHUNK_SIZE = 900
+        // Stay well under SQLite's 999 bound-variable limit (and the binder cap) while keeping
+        // the number of MediaStore round-trips small during a 10-15 GB vault import.
+        private const val URIS_PER_MEDIA_QUERY = 400
         private const val STARTUP_MEDIA_LIMIT = 250
         private const val CATEGORY_THUMBNAIL_MAX_IDS = 100
 

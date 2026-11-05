@@ -9,6 +9,7 @@ import com.bumptech.glide.load.data.DataFetcher
 import com.bumptech.glide.load.model.ModelLoader
 import com.bumptech.glide.load.model.ModelLoaderFactory
 import com.bumptech.glide.load.model.MultiModelLoaderFactory
+import com.dot.gallery.data.thumbnail.VaultThumbnailStore
 import java.io.File
 import java.io.InputStream
 import java.security.MessageDigest
@@ -32,7 +33,7 @@ class EncryptedStreamingFileLoader(
         if (!handles(model)) return null
         return ModelLoader.LoadData(
             StreamVaultKey(model.path),
-            EncryptedSourceFetcher(model, context)
+            EncryptedSourceFetcher(model, context, options.get(VaultThumbnailOption))
         )
     }
 
@@ -62,7 +63,7 @@ class EncryptedStreamingUriLoader(
         if (!handles(model)) return null
         return ModelLoader.LoadData(
             StreamVaultKey(file.path),
-            EncryptedSourceFetcher(file, context)
+            EncryptedSourceFetcher(file, context, options.get(VaultThumbnailOption))
         )
     }
 
@@ -83,7 +84,8 @@ data class StreamVaultKey(private val path: String) : com.bumptech.glide.load.Ke
 /* Fetcher returning EncryptedMediaSource */
 private class EncryptedSourceFetcher(
     private val file: File,
-    private val context: Context
+    private val context: Context,
+    private val useThumbnail: Boolean
 ) : DataFetcher<EncryptedMediaSource> {
     private var data: EncryptedMediaSource? = null
     private var cancelled = false
@@ -91,7 +93,22 @@ private class EncryptedSourceFetcher(
     override fun loadData(priority: Priority, callback: DataFetcher.DataCallback<in EncryptedMediaSource>) {
         if (cancelled) return
         try {
-            val src = createEncryptedMediaSource(context, file)
+            // Grid requests opt into the pre-generated encrypted tile; everything else (viewer,
+            // video playback, missing tile) takes the original path.
+            val thumbnail = if (useThumbnail) {
+                VaultThumbnailStore.thumbnailForEncrypted(context.filesDir, file)
+                    ?.let { createVaultThumbnailSource(context, it) }
+            } else null
+            val src = thumbnail ?: createEncryptedMediaSource(context, file)
+            // Legacy vaults have no stored tile. Freeze one from the already-decrypted source
+            // the first time the cell is drawn, so old vaults also get fast after one pass.
+            if (thumbnail == null && useThumbnail && !src.isVideo) {
+                runCatching {
+                    val vault = vaultForEncryptedFile(file) ?: return@runCatching
+                    val mediaId = file.nameWithoutExtension.toLongOrNull() ?: return@runCatching
+                    VaultThumbnailStore.get(context).ensureFromStream(vault, mediaId) { src.openStream() }
+                }
+            }
             data = src
             callback.onDataReady(src)
         } catch (t: Throwable) {

@@ -20,6 +20,7 @@ import com.bumptech.glide.load.resource.gif.GifDrawable
 import com.bumptech.glide.request.RequestListener
 import com.bumptech.glide.request.target.Target
 import com.bumptech.glide.signature.ObjectKey
+import com.dot.gallery.core.decoder.glide.VaultThumbnailOption
 import com.dot.gallery.core.LocalEventHandler
 import com.dot.gallery.core.LocalMediaDistributor
 import com.dot.gallery.core.LocalMediaHandler
@@ -150,6 +151,11 @@ val GlideMediaImageRenderer = object : MediaImageRenderer {
         // skips the extra thumbnail sub-request for them so they decode once, not twice.
         val isHeavyCodec = HEAVY_CODEC_EXTENSIONS.any { signatureStr.contains(it, ignoreCase = true) }
         val tier = if (useMotionThumbnail) "MOTION" else "REFINED"
+        // Vault items are served from their pre-generated encrypted tile. GIF/APNG stay on the
+        // full file for the idle refined pass so they still animate; their motion tier is static
+        // and does use the tile.
+        val isVaultModel = isEncryptedVaultModel(model)
+        val useVaultThumbnailRefined = isVaultModel && !isGif && !isAnimatable
         GlideImage(
             modifier = modifier,
             model = model,
@@ -167,6 +173,7 @@ val GlideMediaImageRenderer = object : MediaImageRenderer {
                 // placeholder, so the same bitmap is decoded once and reused (no flicker/re-decode).
                 var motion = base.clone().override(THUMBNAIL_MOTION_PX)
                 if (signature != null) motion = motion.signature(ObjectKey(signatureStr))
+                if (isVaultModel) motion = motion.set(VaultThumbnailOption, true)
 
                 var request = if (useMotionThumbnail) {
                     // Moving and not yet refined: load only the cheap tier.
@@ -175,6 +182,7 @@ val GlideMediaImageRenderer = object : MediaImageRenderer {
                     var refined = base
                     if (signature != null) refined = refined.signature(ObjectKey(signatureStr))
                     refined = refined.addListener(refinedLoadListener)
+                    if (useVaultThumbnailRefined) refined = refined.set(VaultThumbnailOption, true)
                     // Show the cached motion bitmap instantly while the refined image decodes.
                     if (!isHeavyCodec) refined = refined.thumbnail(motion)
                     refined
@@ -193,6 +201,17 @@ val GlideMediaImageRenderer = object : MediaImageRenderer {
             }
         )
     }
+}
+
+/**
+ * True when a Glide model points at an encrypted vault file (`file://.../<id>.enc`).
+ * Vault models are the only ones that carry a pre-generated encrypted thumbnail.
+ */
+private fun isEncryptedVaultModel(model: Any?): Boolean = when (model) {
+    is android.net.Uri ->
+        model.scheme == "file" && model.path?.endsWith(".enc", ignoreCase = true) == true
+    is java.io.File -> model.extension.equals("enc", ignoreCase = true)
+    else -> false
 }
 
 /**

@@ -8,12 +8,15 @@ import com.dot.gallery.core.decryption.DecryptResult
 import com.dot.gallery.core.decryption.MediaMetadataCacheEntry
 import com.dot.gallery.core.decryption.VaultDecryptStore
 import com.dot.gallery.data.data_source.KeychainHolder
+import com.dot.gallery.data.thumbnail.VaultThumbnailStore
+import com.dot.gallery.domain.model.Vault
 import com.dot.gallery.core.logging.printError
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.io.InputStream
 import java.util.concurrent.atomic.AtomicBoolean
+import kotlin.uuid.Uuid
 
 /**
  * Streaming representation of an encrypted media file.
@@ -74,6 +77,30 @@ data class EncryptedMediaSource(
 }
 
 private const val FALLBACK_SMALL_DECRYPT_THRESHOLD = 2 * 1024 * 1024 // 2MB fallback if adaptive not available
+
+/**
+ * Wrap an encrypted thumbnail (`filesDir/.vault_thumbs/<uuid>/<id>.thumb`) as a Glide source.
+ * Thumbnails are small, so they are decrypted straight into memory — no temp file, no
+ * [VaultDecryptStore] bookkeeping. Returns null (caller falls back to the original) if the
+ * thumbnail cannot be decrypted.
+ */
+internal fun createVaultThumbnailSource(context: Context, thumbnailFile: File): EncryptedMediaSource? =
+    runCatching {
+        val vaultId = thumbnailFile.parentFile?.name ?: error("no vault id for ${thumbnailFile.path}")
+        val vault = Vault(uuid = Uuid.parse(vaultId), name = "")
+        val bytes = VaultThumbnailStore.get(context).readThumbnailBytes(vault, thumbnailFile)
+        if (bytes.isEmpty()) error("empty thumbnail")
+        EncryptedMediaSource(
+            file = thumbnailFile,
+            mimeType = "image/jpeg",
+            isVideo = false,
+            sizeBytes = bytes.size.toLong(),
+            smallBytes = bytes,
+            tempFile = null,
+            releaseAction = null,
+            contextRef = context.applicationContext
+        )
+    }.getOrNull()
 
 internal fun createEncryptedMediaSource(context: Context, file: File): EncryptedMediaSource {
     val adaptiveThreshold = runCatching {
