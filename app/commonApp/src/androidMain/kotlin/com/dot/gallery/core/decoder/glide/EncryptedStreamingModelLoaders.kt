@@ -33,7 +33,7 @@ class EncryptedStreamingFileLoader(
         if (!handles(model)) return null
         return ModelLoader.LoadData(
             StreamVaultKey(model.path),
-            EncryptedSourceFetcher(model, context, options.get(VaultThumbnailOption))
+            EncryptedSourceFetcher(model, context, options.get(VaultThumbnailOption) == true)
         )
     }
 
@@ -63,7 +63,7 @@ class EncryptedStreamingUriLoader(
         if (!handles(model)) return null
         return ModelLoader.LoadData(
             StreamVaultKey(file.path),
-            EncryptedSourceFetcher(file, context, options.get(VaultThumbnailOption))
+            EncryptedSourceFetcher(file, context, options.get(VaultThumbnailOption) == true)
         )
     }
 

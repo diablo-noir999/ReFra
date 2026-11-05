@@ -32,7 +32,7 @@ class EncryptedFileModelLoader(
         if (!handles(model)) return null
         return ModelLoader.LoadData(
             EncryptedVaultKey(model.path),
-            EncryptedVaultFetcher(model, context, options.get(VaultThumbnailOption))
+            EncryptedVaultFetcher(model, context, options.get(VaultThumbnailOption) == true)
         )
     }
 
@@ -65,7 +65,7 @@ class EncryptedUriModelLoader(
         if (!handles(model)) return null
         return ModelLoader.LoadData(
             EncryptedVaultKey(file.path),
-            EncryptedVaultFetcher(file, context, options.get(VaultThumbnailOption))
+            EncryptedVaultFetcher(file, context, options.get(VaultThumbnailOption) == true)
         )
     }
 
