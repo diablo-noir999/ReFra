@@ -31,6 +31,12 @@
 -keep class com.adobe.** { *; }
 -keep class ai.onnxruntime.** { *; }
 
+# kotlinx.parcelize.Parcelize is a BINARY-retention annotation whose class lives only in
+# kotlin-parcelize-runtime (compile time). The @Parcelize codegen has already run, so no
+# runtime code references it; without this R8 fails the release build with
+# "Missing class kotlinx.parcelize.Parcelize (referenced from: ...FrameIdentity and 22 other contexts)".
+-dontwarn kotlinx.parcelize.**
+
 -dontwarn com.google.auto.value.AutoValue$Builder
 -dontwarn com.google.auto.value.AutoValue
 -dontwarn org.tensorflow.lite.gpu.GpuDelegateFactory$Options$GpuBackend
