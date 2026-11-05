@@ -387,7 +387,9 @@ jobs:
   deploy_pages:
     name: Deploy documentation to GitHub Pages
     needs: release
-    runs-on: ubuntu-latest
+    # Playwright refuses to install Chromium on ubuntu-26.04 ("not supported yet"), and
+    # ubuntu-latest now resolves to 26.04. Pin the last image Playwright supports.
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     permissions:
       contents: read
