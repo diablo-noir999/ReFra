@@ -312,7 +312,7 @@ jobs:
               local name hash url arch
               name=$(basename "$apk")
               hash=$(sha256sum "$apk" | awk '{print $1}')
-              url="https://github.com/IacobIonut01/ReFra/releases/download/${tag}/${name}"
+              url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${tag}/${name}"
               case "$name" in
                 *-arm64-v8a-release.apk) arch="arm64-v8a" ;;
                 *-armeabi-v7a-release.apk) arch="armeabi-v7a" ;;
@@ -340,7 +340,7 @@ jobs:
             if [ -n "$apk" ]; then
               name=$(basename "$apk")
               hash=$(sha256sum "$apk" | awk '{print $1}')
-              url="https://github.com/IacobIonut01/ReFra/releases/download/${tag}/${name}"
+              url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${tag}/${name}"
               echo "| Best for most people | Standard (NoML) · Universal | Android 10 (API 29) | [Click Here](${url}) | \`${hash}\` |"
             else
               echo "| Best for most people | Standard (NoML) · Universal | Android 10 (API 29) | _Unavailable_ | |"
