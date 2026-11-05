@@ -344,8 +344,6 @@ class KeychainHolder @Inject constructor(
      * header writes, stream round-trips) several-fold during bulk import.
      */
     private val STREAM_CHUNK_SIZE = 4 * 1024 * 1024
-    private const val MIN_CHUNK_SIZE = 64 * 1024
-    private const val MAX_CHUNK_SIZE = 64 * 1024 * 1024 // reject corrupt/hostile length prefixes
 
     fun encryptPortableContent(vault: Vault, plaintext: ByteArray): ByteArray {
         val dk = loadDataKey(vault) ?: error("Data key missing for portable vault")
@@ -714,6 +712,9 @@ class KeychainHolder @Inject constructor(
         const val VAULT_INFO_FILE_NAME = "info.vault"
         const val DATA_KEY_FILE_NAME = "vault.key.enc"
         const val VAULT_THUMBS_DIR_NAME = ".vault_thumbs"
+
+        private const val MIN_CHUNK_SIZE = 64 * 1024
+        private const val MAX_CHUNK_SIZE = 64 * 1024 * 1024 // reject corrupt/hostile length prefixes
 
         /** Stale encrypted-write scratch files are only removed after this long (ms). */
         private const val STALE_TEMP_MS = 6 * 60 * 60 * 1000L
