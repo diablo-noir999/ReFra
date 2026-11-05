@@ -408,6 +408,14 @@ jobs:
           distribution: temurin
           java-version: 21
       - uses: gradle/actions/setup-gradle@v4
+      - name: Tune Gradle for CI
+        run: |
+          # The repo default is -Xmx8g daemon + -Xmx6g Kotlin daemon, which overcommits a
+          # 16 GB hosted runner; the wasmJs optimizer then gets the runner OOM-killed
+          # ("The runner has received a shutdown signal") ~2 min into the task.
+          echo "org.gradle.jvmargs=-Xmx4g -Dfile.encoding=UTF-8" >> gradle.properties
+          echo "org.gradle.workers.max=2" >> gradle.properties
+          echo "kotlin.daemon.jvmargs=-Xmx3g" >> gradle.properties
       - name: Fix Gradle wrapper permissions
         run: chmod +x ./gradlew
       - uses: actions/setup-node@v4
