@@ -1,5 +1,37 @@
 #!/usr/bin/env bash
 
+# Keep CMake 4.x usable: these upstream projects still declare
+# `cmake_minimum_required(VERSION < 3.5)`, which CMake 4 rejects outright. The flag is ignored
+# by CMake 3.x and restores the old policy behaviour on 4.x.
+NATIVE_CMAKE_COMPAT_FLAGS=(-DCMAKE_POLICY_VERSION_MINIMUM=3.5)
+
+# Resolve a CMake binary for the native stacks.
+#
+# Prefers the SDK-installed pinned 3.x CMake (the configuration this repo builds and tests with),
+# then any other 3.x CMake under the SDK, then whatever `cmake` is on PATH. The PATH fallback may
+# be CMake 4.x, which is why every configure invocation also passes NATIVE_CMAKE_COMPAT_FLAGS.
+# Sets CMAKE_BIN and NINJA_BIN for the caller.
+native_resolve_cmake() {
+    local sdk="$1" preferred="${2:-3.31.6}" candidate
+    for candidate in "$sdk/cmake/$preferred/bin/cmake" "$sdk"/cmake/3.*/bin/cmake; do
+        [ -x "$candidate" ] || continue
+        CMAKE_BIN="$candidate"
+        NINJA_BIN="$(dirname "$candidate")/ninja"
+        [ -x "$NINJA_BIN" ] || NINJA_BIN="$(command -v ninja || true)"
+        return 0
+    done
+    CMAKE_BIN="$(command -v cmake || true)"
+    NINJA_BIN="$(command -v ninja || true)"
+    if [ -z "$NINJA_BIN" ]; then
+        NINJA_BIN="$(ls -1d "$sdk"/cmake/*/bin/ninja 2>/dev/null | head -n1 || true)"
+    fi
+    if [ -z "$CMAKE_BIN" ]; then
+        echo "ERROR: no CMake found (SDK cmake $preferred missing and cmake not on PATH)." >&2
+        return 1
+    fi
+    echo "WARNING: SDK CMake $preferred not installed; falling back to $("$CMAKE_BIN" --version | head -n1)." >&2
+}
+
 native_sha256() {
     if command -v sha256sum >/dev/null 2>&1; then
         sha256sum "$1" | awk '{print $1}'

@@ -49,13 +49,8 @@ if [ -z "$NDK_VERSION" ] || [ ! -f "$TOOLCHAIN" ] ||
     exit 1
 fi
 
-CMAKE_BIN="$SDK/cmake/$CMAKE_VERSION/bin/cmake"
-NINJA_BIN="$SDK/cmake/$CMAKE_VERSION/bin/ninja"
-if [ ! -x "$CMAKE_BIN" ]; then
-    CMAKE_BIN="$(command -v cmake || true)"
-    NINJA_BIN="$(command -v ninja || true)"
-fi
-if [ -z "$CMAKE_BIN" ]; then echo "ERROR: cmake $CMAKE_VERSION not found." >&2; exit 1; fi
+native_resolve_cmake "$SDK" "$CMAKE_VERSION"
+if [ -z "$CMAKE_BIN" ]; then exit 1; fi
 
 echo "SDK      = $SDK"
 echo "NDK      = $NDK_DIR"
@@ -96,6 +91,7 @@ build_abi() {
     local COMMON=(
         -G Ninja
         -DCMAKE_MAKE_PROGRAM="$NINJA_BIN"
+        "${NATIVE_CMAKE_COMPAT_FLAGS[@]}"
         -DCMAKE_TOOLCHAIN_FILE="$TOOLCHAIN"
         -DANDROID_ABI="$ABI" -DANDROID_PLATFORM="android-$ANDROID_API"
         -DCMAKE_BUILD_TYPE=Release
