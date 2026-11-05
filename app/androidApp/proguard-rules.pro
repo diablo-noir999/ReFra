@@ -37,6 +37,13 @@
 # "Missing class kotlinx.parcelize.Parcelize (referenced from: ...FrameIdentity and 22 other contexts)".
 -dontwarn kotlinx.parcelize.**
 
+# Room builds its generated database implementation by name and instantiates it reflectively.
+# R8 kept WorkDatabase_Impl but removed its no-arg constructor (nothing calls it statically),
+# so the app died at startup with "Failed to create an instance of class
+# androidx.work.impl.WorkDatabase". room-runtime's consumer rule only keeps the class name.
+-keep class * extends androidx.room.RoomDatabase { <init>(); }
+-dontwarn androidx.room.paging.**
+
 -dontwarn com.google.auto.value.AutoValue$Builder
 -dontwarn com.google.auto.value.AutoValue
 -dontwarn org.tensorflow.lite.gpu.GpuDelegateFactory$Options$GpuBackend
