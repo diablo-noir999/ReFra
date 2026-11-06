@@ -17,7 +17,10 @@ manifestConfig {
             listOf(
                 "android.permission.INTERNET",
                 "android.permission.ACCESS_WIFI_STATE",
-                "android.permission.ACCESS_NETWORK_STATE",
+                // ACCESS_NETWORK_STATE is NOT stripped: WorkManager and the app's network
+                // callback ask ConnectivityManager whether a network exists, which throws
+                // SecurityException (and kills the process) without it. It grants no network
+                // access, so the offline variant still cannot reach the internet.
                 "android.permission.CHANGE_WIFI_MULTICAST_STATE",
                 "android.permission.ACCESS_FINE_LOCATION"
             )
