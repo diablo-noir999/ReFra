@@ -403,6 +403,18 @@ jobs:
       DOCS_BASE: /${{ github.event.repository.name }}
     steps:
       - uses: actions/checkout@v6
+      - name: Add swap for the wasm optimizer
+        run: |
+          # The wasmJs production optimizer gets the hosted runner VM killed
+          # ("The runner has received a shutdown signal") partway through the task.
+          # Give the kernel somewhere to page instead of OOM-killing the runner.
+          free -h
+          df -h /
+          sudo fallocate -l 6G /swapfile || sudo dd if=/dev/zero of=/swapfile bs=1M count=6144
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+          free -h
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
