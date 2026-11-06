@@ -26,6 +26,7 @@ import java.io.BufferedOutputStream
 import java.nio.file.Files
 import java.nio.file.StandardCopyOption
 import java.security.GeneralSecurityException
+import java.security.KeyStore
 import java.security.MessageDigest
 import java.security.SecureRandom
 import java.util.Base64
@@ -49,7 +50,8 @@ class KeychainHolder @Inject constructor(
     val filesDir: File = context.filesDir
 
     fun vaultFolder(vault: Vault) = File(filesDir, vault.uuid.toString())
-    private fun vaultInfoFile(vault: Vault) = File(vaultFolder(vault), VAULT_INFO_FILE_NAME)
+    fun vaultInfoFile(vault: Vault) = File(vaultFolder(vault), VAULT_INFO_FILE_NAME)
+    fun dataKeyFileExists(vault: Vault) = dataKeyFile(vault).exists()
     fun Vault.mediaFile(mediaId: Long) = File(vaultFolder(this), "$mediaId.enc")
 
     /**
@@ -63,6 +65,67 @@ class KeychainHolder @Inject constructor(
     @PublishedApi internal val masterKey: MasterKey = MasterKey.Builder(context)
         .setKeyScheme(MasterKey.KeyScheme.AES256_GCM)
         .build()
+
+    /**
+     * Wrapping format for small payloads (vault data key, legacy vault metadata):
+     * `KEYWRAPv1`(9 bytes) | GCM nonce (12 bytes) | ciphertext+tag.
+     *
+     * The payload is encrypted with the same AndroidKeyStore master key that [EncryptedFile]
+     * would have used, but without EncryptedFile itself. Its streaming scheme binds the
+     * associated data to the file NAME (Tink calls newEncryptingStream(..., mFile.name)),
+     * so a payload encrypted as `x.tmp` and atomically published (renamed) as `x` can never
+     * be decrypted again: Tink fails with "No matching key found for the ciphertext in the
+     * stream". Our format has no path-derived data, so the crash-safe tmp+rename publish
+     * stays valid.
+     */
+    @PublishedApi internal val KEYWRAP_MAGIC: ByteArray = "KEYWRAPv1".toByteArray()
+
+    private val KEYWRAP_NONCE_OFFSET = KEYWRAP_MAGIC.size
+    private val KEYWRAP_CT_OFFSET = KEYWRAP_NONCE_OFFSET + 12
+
+    /** The AndroidKeyStore key behind [masterKey], usable in a Cipher directly. */
+    @PublishedApi internal val aeadKey: SecretKey by lazy {
+        val alias = MasterKey.DEFAULT_MASTER_KEY_ALIAS
+        val ks = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
+        requireNotNull(ks.getKey(alias, null) as? SecretKey) {
+            "Master key $alias missing from AndroidKeyStore"
+        }
+    }
+
+    /** Encrypt a small payload into the rename-safe wrap format. */
+    @PublishedApi
+    internal fun wrapWithMasterKey(payload: ByteArray): ByteArray {
+        val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+        // AndroidKeyStore refuses caller-supplied nonces (CALLER_NONCE_PROHIBITED): the master
+        // key was generated with randomized encryption, so Keystore derives the IV itself.
+        // Same pattern as Tink's AndroidKeystoreAesGcm: init without a spec, then store
+        // cipher.getIV() in front of the ciphertext so decrypt can feed it back.
+        cipher.init(Cipher.ENCRYPT_MODE, aeadKey)
+        val ct = cipher.doFinal(payload)
+        val iv = cipher.iv ?: error("Keystore did not return an IV")
+        return ByteArray(KEYWRAP_CT_OFFSET + ct.size).apply {
+            System.arraycopy(KEYWRAP_MAGIC, 0, this, 0, KEYWRAP_MAGIC.size)
+            System.arraycopy(iv, 0, this, KEYWRAP_NONCE_OFFSET, iv.size)
+            System.arraycopy(ct, 0, this, KEYWRAP_CT_OFFSET, ct.size)
+        }
+    }
+
+    /** Decrypt a payload produced by [wrapWithMasterKey]. */
+    @PublishedApi
+    internal fun unwrapWithMasterKey(payload: ByteArray): ByteArray {
+        require(payload.size > KEYWRAP_CT_OFFSET) { "keywrap payload too short (${payload.size} bytes)" }
+        val iv = payload.copyOfRange(KEYWRAP_NONCE_OFFSET, KEYWRAP_CT_OFFSET)
+        val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+        // Supplying the IV is only banned for ENCRYPT under this key policy; decryption
+        // requires it.
+        cipher.init(Cipher.DECRYPT_MODE, aeadKey, GCMParameterSpec(128, iv))
+        return cipher.doFinal(payload, KEYWRAP_CT_OFFSET, payload.size - KEYWRAP_CT_OFFSET)
+    }
+
+    @PublishedApi
+    internal fun isKeywrapFile(payload: ByteArray): Boolean =
+        payload.size > KEYWRAP_CT_OFFSET &&
+            payload.copyOfRange(0, KEYWRAP_MAGIC.size).contentEquals(KEYWRAP_MAGIC)
 
     /**
      * Legacy write: always device-locked (non-transferable). Kept for backward compatibility.
@@ -93,8 +156,9 @@ class KeychainHolder @Inject constructor(
 
     /**
      * New portable vault initialization.
-     * When transferable=true we generate a random 32-byte Data Key (DK), wrap it with EncryptedFile
-     * and store plaintext metadata (VaultInfo) containing dkHash for integrity.
+     * When transferable=true we generate a random 32-byte Data Key (DK), wrap it with the
+     * AndroidKeyStore master key (rename-safe KEYWRAP format) and store plaintext metadata
+     * (VaultInfo) containing dkHash for integrity.
      */
     fun writeVaultInfo(
         vault: Vault,
@@ -115,16 +179,15 @@ class KeychainHolder @Inject constructor(
                     val dkFile = dataKeyFile(vault)
                     val existingKey = if (force) null else readDataKeyFile(vault)
                     val dk = existingKey ?: generateDataKey().also { key ->
-                        // Store encrypted with MasterKey for local-at-rest protection, atomically:
-                        // a torn key file would make the whole vault undecryptable.
+                        // Store wrapped with MasterKey for local-at-rest protection, atomically:
+                        // a torn key file would make the whole vault undecryptable. The wrap
+                        // format is path-agnostic (see KEYWRAP_MAGIC), so tmp+rename is safe.
                         val tmp = tempFileFor(dkFile).apply { delete() }
                         try {
-                            EncryptedFile.Builder(
-                                context,
-                                tmp,
-                                masterKey,
-                                AES256_GCM_HKDF_4KB
-                            ).build().openFileOutput().use { it.write(key) }
+                            FileOutputStream(tmp).use { fos ->
+                                fos.write(wrapWithMasterKey(key))
+                                fos.fd.sync()
+                            }
                             commitEncryptedFile(tmp, dkFile)
                         } catch (t: Throwable) {
                             tmp.delete()
@@ -264,7 +327,10 @@ class KeychainHolder @Inject constructor(
     fun isTransferable(vault: Vault): Boolean = try {
         val info = readVaultInfo(vault) ?: return false
         info.transferable
-    } catch (_: Exception) { false }
+    } catch (e: Exception) {
+        printError(TAG, "isTransferable(${vault.uuid}): metadata unreadable", e)
+        false
+    }
 
     fun readVaultInfo(vault: Vault): VaultInfo? {
         val infoFile = vaultInfoFile(vault)
@@ -273,8 +339,9 @@ class KeychainHolder @Inject constructor(
             // Try plaintext JSON first (portable). If that fails fall back to legacy encrypted
             val text = infoFile.readText()
             fromKotlinByteArray<VaultInfo>(text.toByteArray())
-        } catch (_: Exception) {
+        } catch (e: Exception) {
             // Legacy path: encrypted Vault object (ignore for portable metadata)
+            printError(TAG, "readVaultInfo(${vault.uuid}): metadata not portable JSON (${infoFile.length()} bytes)", e)
             null
         }
     }
@@ -307,7 +374,11 @@ class KeychainHolder @Inject constructor(
 
     /** Load raw DK (only for transferable vault). */
     fun loadDataKey(vault: Vault): ByteArray? {
-        if (!isTransferable(vault)) return null
+        if (!isTransferable(vault)) {
+            val info = runCatching { readVaultInfo(vault) }.getOrNull()
+            printError(TAG, "loadDataKey(${vault.uuid}): vault is not portable. infoFile=${vaultInfoFile(vault).length()}b info=$info dkFileExists=${dataKeyFile(vault).exists()}")
+            return null
+        }
         return readDataKeyFile(vault)
     }
 
@@ -316,12 +387,21 @@ class KeychainHolder @Inject constructor(
         val file = dataKeyFile(vault)
         if (!file.exists()) return null
         return runCatching {
-            EncryptedFile.Builder(
-                context,
-                file,
-                masterKey,
-                AES256_GCM_HKDF_4KB
-            ).build().openFileInput().use { it.readBytes() }
+            val raw = file.readBytes()
+            if (isKeywrapFile(raw)) {
+                unwrapWithMasterKey(raw)
+            } else {
+                // Pre-KEYWRAP files were wrapped in place with EncryptedFile (name-bound AAD);
+                // those decrypt through the original path.
+                EncryptedFile.Builder(
+                    context,
+                    file,
+                    masterKey,
+                    AES256_GCM_HKDF_4KB
+                ).build().openFileInput().use { it.readBytes() }
+            }
+        }.onFailure {
+            printError(TAG, "Cannot decrypt data key for ${vault.uuid} (${file.length()} bytes)", it)
         }.getOrNull()
     }
 
@@ -517,15 +597,13 @@ class KeychainHolder @Inject constructor(
                     readDataKeyFile(vault)?.let { writePortableMetadata(vault, it) }
                     return true
                 }
-                // Write encrypted DK file atomically: a torn key file bricks the vault.
+                // Write wrapped DK file atomically: a torn key file bricks the vault.
                 val dkTmp = tempFileFor(dkFile).apply { delete() }
                 try {
-                    EncryptedFile.Builder(
-                        context,
-                        dkTmp,
-                        masterKey,
-                        AES256_GCM_HKDF_4KB
-                    ).build().openFileOutput().use { it.write(dk) }
+                    FileOutputStream(dkTmp).use { fos ->
+                        fos.write(wrapWithMasterKey(dk))
+                        fos.fd.sync()
+                    }
                     commitEncryptedFile(dkTmp, dkFile)
                 } catch (t: Throwable) {
                     dkTmp.delete()
@@ -621,13 +699,21 @@ class KeychainHolder @Inject constructor(
     private fun ByteArray.toAesKey(): SecretKey = SecretKeySpec(this, "AES")
 
     @Throws(GeneralSecurityException::class, IOException::class, FileNotFoundException::class, UserNotAuthenticatedException::class)
-    inline fun <reified T> File.decryptKotlin(): T = EncryptedFile.Builder(
-        context,
-        this,
-        masterKey,
-        AES256_GCM_HKDF_4KB
-    ).build().openFileInput().use {
-        fromKotlinByteArray(it.readBytes())
+    inline fun <reified T> File.decryptKotlin(): T {
+        val raw = readBytes()
+        val plain = if (isKeywrapFile(raw)) {
+            unwrapWithMasterKey(raw)
+        } else {
+            // Pre-KEYWRAP payloads were encrypted with EncryptedFile directly at their final
+            // name (name-bound AAD) and stay readable through the original scheme.
+            EncryptedFile.Builder(
+                context,
+                this,
+                masterKey,
+                AES256_GCM_HKDF_4KB
+            ).build().openFileInput().use { it.readBytes() }
+        }
+        return fromKotlinByteArray(plain)
     }
 /*
     @Throws(GeneralSecurityException::class, IOException::class, FileNotFoundException::class, UserNotAuthenticatedException::class)
@@ -642,14 +728,7 @@ class KeychainHolder @Inject constructor(
 
     @Throws(GeneralSecurityException::class, IOException::class, FileNotFoundException::class, UserNotAuthenticatedException::class)
     inline fun <reified T> File.encryptKotlin(data: T) {
-        EncryptedFile.Builder(
-            context,
-            this,
-            masterKey,
-            AES256_GCM_HKDF_4KB
-        ).build().openFileOutput().use {
-            it.write(data.toKotlinByteArray())
-        }
+        writeBytes(wrapWithMasterKey(data.toKotlinByteArray()))
     }
 
     @Throws(IOException::class)

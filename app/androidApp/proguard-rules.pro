@@ -44,6 +44,17 @@
 -keep class * extends androidx.room.RoomDatabase { <init>(); }
 -dontwarn androidx.room.paging.**
 
+# Same story for WorkManager: InputMergerKt does Class.forName(name) +
+# getDeclaredConstructor().newInstance(), and WorkManager stores the merger class
+# name in each WorkRequest. R8 removed OverwritingInputMerger's constructor, so
+# every queued job died in WM-InputMerger with NoSuchMethodException while
+# VaultOperationWorker kept retrying and the vault stayed empty.
+-keep class * extends androidx.work.InputMerger { <init>(); }
+
+# ListenableWorker subclasses are also instantiated by name; keep all constructors
+# (the work-runtime consumer rule only keeps public ones).
+-keep class * extends androidx.work.ListenableWorker { <init>(...); }
+
 -dontwarn com.google.auto.value.AutoValue$Builder
 -dontwarn com.google.auto.value.AutoValue
 -dontwarn org.tensorflow.lite.gpu.GpuDelegateFactory$Options$GpuBackend

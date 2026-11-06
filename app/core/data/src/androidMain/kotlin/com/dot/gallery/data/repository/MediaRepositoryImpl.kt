@@ -1215,6 +1215,10 @@ class MediaRepositoryImpl(
                 // Ensure vault uses portable format for streaming encryption
                 if (!isTransferable(vault)) {
                     writeVaultInfo(vault, transferable = true)
+                    if (loadDataKey(vault) == null) {
+                        val infoFile = with(keychainHolder) { vaultInfoFile(vault) }
+                        printError(TAG, "Portable upgrade for ${vault.uuid} did not yield a readable data key. infoFile=${infoFile.length()}b dkFile=${keychainHolder.dataKeyFileExists(vault)}")
+                    }
                 }
                 // Encrypt into a scratch file and publish it atomically at the very end. If the
                 // process dies mid-encryption, the previous vault copy (if any) is untouched and
